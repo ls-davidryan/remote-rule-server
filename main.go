@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 )
 
 const (
@@ -13,7 +19,8 @@ const (
 )
 
 func main() {
-	http.HandleFunc("/rule", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rule", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s %s", r.Method, r.URL.Path)
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -48,8 +55,40 @@ func main() {
 		json.NewEncoder(w).Encode(response)
 	})
 
-	log.Println("server listening on :8080")
-	http.ListenAndServe(":8080", nil)
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
+
+	// Run the server in a goroutine so main can wait for a shutdown signal.
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Println("server listening on :8080")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	// Wait for either a fatal server error or a termination signal (SIGINT
+	// from Ctrl+C, SIGTERM from `kill`/`make` cleanup).
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case err := <-serverErr:
+		log.Fatalf("server error: %v", err)
+	case sig := <-stop:
+		log.Printf("received %s, shutting down...", sig)
+	}
+
+	// Give in-flight requests up to 10s to finish, then force close.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("graceful shutdown failed, forcing close: %v", err)
+		srv.Close()
+	}
+	log.Println("server stopped")
 }
 
 func containsProduct(items []LineItem, productID string) bool {
